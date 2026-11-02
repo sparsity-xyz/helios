@@ -59,6 +59,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
+ "getrandom 0.3.3",
  "once_cell",
  "version_check",
  "zerocopy",
@@ -436,7 +437,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
- "wasmtimer 0.4.2",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -458,7 +459,7 @@ dependencies = [
  "tokio-stream",
  "tower 0.5.2",
  "tracing",
- "wasmtimer 0.4.2",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -506,7 +507,7 @@ dependencies = [
  "tower 0.5.2",
  "tracing",
  "url",
- "wasmtimer 0.4.2",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -783,7 +784,7 @@ dependencies = [
  "tower 0.5.2",
  "tracing",
  "url",
- "wasmtimer 0.4.2",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -3345,7 +3346,7 @@ version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
 dependencies = [
- "gloo-timers 0.2.6",
+ "gloo-timers",
  "send_wrapper 0.4.0",
 ]
 
@@ -3501,16 +3502,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gloo-timers"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "gloo-utils"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3597,6 +3588,12 @@ name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a9ee70c43aaf417c914396645a0fa852624801b24ebb7ae78fe8272889ac888"
+
+[[package]]
+name = "hashbrown"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43a3c133739dddd0d2990f9a4bdf8eb4b21ef50e4851ca85ab661199821d510e"
 
 [[package]]
 name = "hashbrown"
@@ -3754,8 +3751,7 @@ dependencies = [
  "tree_hash",
  "tree_hash_derive",
  "typenum",
- "wasmtimer 0.2.1",
- "zduny-wasm-timer",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -3768,7 +3764,6 @@ dependencies = [
  "eyre",
  "futures",
  "getrandom 0.3.3",
- "gloo-timers 0.3.0",
  "helios-common",
  "helios-ethereum",
  "helios-test-utils",
@@ -3779,6 +3774,7 @@ dependencies = [
  "parking_lot 0.12.4",
  "reqwest 0.12.22",
  "revm",
+ "schnellru",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
@@ -3786,7 +3782,7 @@ dependencies = [
  "tracing",
  "url",
  "wasm-bindgen-futures",
- "wasmtimer 0.2.1",
+ "wasmtimer",
 ]
 
 [[package]]
@@ -3926,6 +3922,7 @@ dependencies = [
  "alloy",
  "console_error_panic_hook",
  "eyre",
+ "futures-util",
  "helios-common",
  "helios-ethereum",
  "helios-linea",
@@ -7653,6 +7650,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "schnellru"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "356285bbf17bea63d9e52e96bd18f039672ac92b55b8cb997d6162a2a37d1649"
+dependencies = [
+ "ahash",
+ "cfg-if",
+ "hashbrown 0.13.2",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9259,23 +9267,9 @@ dependencies = [
 
 [[package]]
 name = "wasmtimer"
-version = "0.2.1"
+version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7ed9d8b15c7fb594d72bfb4b5a276f3d2029333cd93a932f376f5937f6f80ee"
-dependencies = [
- "futures",
- "js-sys",
- "parking_lot 0.12.4",
- "pin-utils",
- "slab",
- "wasm-bindgen",
-]
-
-[[package]]
-name = "wasmtimer"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8d49b5d6c64e8558d9b1b065014426f35c18de636895d24893dbbd329743446"
+checksum = "1c598d6b99ea013e35844697fc4670d08339d5cda15588f193c6beedd12f644b"
 dependencies = [
  "futures",
  "js-sys",

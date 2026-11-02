@@ -94,9 +94,7 @@ impl OpStackClient {
         let sub_type: SubscriptionType = serde_wasm_bindgen::from_value(sub_type)?;
         let rx = map_err(self.inner.subscribe(sub_type).await)?;
 
-        let subscription = Subscription::<OpStack>::new(id.clone());
-
-        subscription.listen(rx, callback).await;
+        let subscription = Subscription::<OpStack>::spawn_listener(id.clone(), rx, callback);
         self.active_subscriptions.insert(id, subscription);
 
         Ok(true)
@@ -118,8 +116,9 @@ impl OpStackClient {
     }
 
     #[wasm_bindgen]
-    pub async fn get_block_number(&self) -> Result<u32, JsError> {
-        map_err(self.inner.get_block_number().await).map(|v| v.to())
+    pub async fn get_block_number(&self) -> Result<String, JsError> {
+        let v = map_err(self.inner.get_block_number().await)?;
+        Ok(format!("0x{:x}", v))
     }
 
     #[wasm_bindgen]
@@ -283,12 +282,13 @@ impl OpStackClient {
         opts: JsValue,
         block: JsValue,
         state_overrides: JsValue,
-    ) -> Result<u32, JsError> {
+    ) -> Result<String, JsError> {
         let opts: OpTransactionRequest = serde_wasm_bindgen::from_value(opts)?;
-        let block: BlockId = serde_wasm_bindgen::from_value(block)?;
+        let block: Option<BlockId> = serde_wasm_bindgen::from_value(block)?;
         let state_overrides: Option<StateOverride> =
             serde_wasm_bindgen::from_value(state_overrides)?;
-        Ok(map_err(self.inner.estimate_gas(&opts, block, state_overrides).await)? as u32)
+        let gas = map_err(self.inner.estimate_gas(&opts, block, state_overrides).await)?;
+        Ok(format!("0x{gas:x}"))
     }
 
     #[wasm_bindgen]
@@ -393,5 +393,14 @@ impl OpStackClient {
     pub async fn get_current_checkpoint(&self) -> Result<JsValue, JsError> {
         // OP Stack does not support checkpoints
         Err(JsError::new("OP Stack does not support checkpoints"))
+    }
+
+    #[wasm_bindgen]
+    pub async fn shutdown(&mut self) {
+        for (_, subscription) in self.active_subscriptions.drain() {
+            subscription.abort();
+        }
+
+        self.inner.shutdown().await;
     }
 }
