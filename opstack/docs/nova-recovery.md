@@ -34,6 +34,11 @@ Base Sepolia bootstrap ENRs are taken from Base v1.5.1; the old list contained
 Base Goerli and mainnet bootnodes. Source
 (https://github.com/base/base/blob/v1.5.1/crates/common/chains/src/config.rs).
 
+Discovery dials same-chain bootstrap peers directly and searches with a chain
+predicate rather than discarding unrelated results after a nearest-node query.
+Debug logs distinguish peer connections, envelope/signature rejection and payload
+decoding failures.
+
 Message IDs include the topic as in the current Base implementation. Snappy
 lengths are bounded before decompression, short messages are rejected, and ENRs
 without TCP ports are skipped. Source

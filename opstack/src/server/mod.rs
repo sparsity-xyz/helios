@@ -95,6 +95,11 @@ impl ServerState {
                     tracing::info!("new commitment for block: {}", payload.block_number);
                     self.latest_commitment = Some((commitment, payload.block_number));
                 }
+            } else {
+                tracing::warn!(
+                    bytes = commitment.data.len(),
+                    "signed gossip payload cannot be decoded"
+                );
             }
         }
     }

@@ -28,15 +28,23 @@ impl BlockHandler {
     }
 
     pub fn handle(&self, msg: Message) -> MessageAcceptance {
-        let Ok(commitment) = SequencerCommitment::new(&msg.data) else {
-            return MessageAcceptance::Reject;
+        let commitment = match SequencerCommitment::new(&msg.data) {
+            Ok(commitment) => commitment,
+            Err(error) => {
+                tracing::debug!(%error, bytes=msg.data.len(), topic=%msg.topic, "invalid gossip envelope");
+                return MessageAcceptance::Reject;
+            }
         };
-
-        if commitment.verify(self.signer, self.chain_id).is_ok() {
-            _ = self.commitment_sender.try_send(commitment);
-            MessageAcceptance::Accept
-        } else {
-            MessageAcceptance::Reject
+        match commitment.verify(self.signer, self.chain_id) {
+            Ok(()) => {
+                tracing::debug!(bytes = commitment.data.len(), "accepted signed gossip");
+                _ = self.commitment_sender.try_send(commitment);
+                MessageAcceptance::Accept
+            }
+            Err(error) => {
+                tracing::debug!(%error, "invalid sequencer gossip signature");
+                MessageAcceptance::Reject
+            }
         }
     }
 }

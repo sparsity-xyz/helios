@@ -102,7 +102,8 @@ fn socket_to_multiaddr(socket: SocketAddr) -> Multiaddr {
 /// Computes the message ID of a `gossipsub` message
 fn compute_message_id(msg: &Message) -> MessageId {
     let decoded = snap::raw::decompress_len(&msg.data)
-        .ok().filter(|len| *len <= 10 * 1024 * 1024)
+        .ok()
+        .filter(|len| *len <= 10 * 1024 * 1024)
         .and_then(|_| snap::raw::Decoder::new().decompress_vec(&msg.data).ok());
     let (domain, data): ([u8; 4], &[u8]) = match &decoded {
         Some(data) => ([1, 0, 0, 0], data),
@@ -262,13 +263,18 @@ mod message_id_tests {
     fn matches_base_reference_and_separates_topics() {
         let mut message = Message {
             source: None,
-            data: snap::raw::Encoder::new().compress_vec(&[1,2,3,4,5]).unwrap(),
+            data: snap::raw::Encoder::new()
+                .compress_vec(&[1, 2, 3, 4, 5])
+                .unwrap(),
             sequence_number: None,
             topic: gossipsub::TopicHash::from_raw("test"),
         };
-        assert_eq!(hex::encode(compute_message_id(&message).0), "adbe547b27f41294a08a09210a5e8531e83cdc16");
-        let first=compute_message_id(&message);
-        message.topic=gossipsub::TopicHash::from_raw("/optimism/84532/3/blocks");
-        assert_ne!(first,compute_message_id(&message));
+        assert_eq!(
+            hex::encode(compute_message_id(&message).0),
+            "adbe547b27f41294a08a09210a5e8531e83cdc16"
+        );
+        let first = compute_message_id(&message);
+        message.topic = gossipsub::TopicHash::from_raw("/optimism/84532/3/blocks");
+        assert_ne!(first, compute_message_id(&message));
     }
 }
