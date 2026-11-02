@@ -77,6 +77,7 @@ impl GossipService {
                         match event {
                             SwarmEvent::Behaviour(event) => event.handle(&mut swarm, &self.block_handler),
                             SwarmEvent::ConnectionEstablished { peer_id, .. } => tracing::info!(%peer_id, "gossip connection established"),
+                            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => tracing::debug!(%peer_id, ?cause, "gossip connection closed"),
                             SwarmEvent::OutgoingConnectionError { error, .. } => tracing::debug!(%error, "gossip connection failed"),
                             _ => {}
                         }
@@ -219,6 +220,15 @@ impl Event {
     /// Handles received gossipsub messages. Ping messages are ignored.
     /// Reports back to [libp2p::gossipsub] to apply peer scoring and forward the message to other peers if accepted.
     fn handle(self, swarm: &mut Swarm<Behaviour>, handler: &BlockHandler) {
+        match &self {
+            Self::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
+                tracing::debug!(%peer_id, %topic, "peer gossip subscription");
+            }
+            Self::Identify(identify::Event::Received { peer_id, info, .. }) => {
+                tracing::debug!(%peer_id, agent=%info.agent_version, protocol=%info.protocol_version, "identified gossip peer");
+            }
+            _ => {}
+        }
         if let Self::Gossipsub(gossipsub::Event::Message {
             propagation_source,
             message_id,
