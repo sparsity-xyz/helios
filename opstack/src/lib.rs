@@ -30,6 +30,10 @@ pub struct SequencerCommitment {
 
 impl SequencerCommitment {
     pub fn new(data: &[u8]) -> Result<Self> {
+        let length = snap::raw::decompress_len(data)?;
+        if !(65..=10 * 1024 * 1024).contains(&length) {
+            eyre::bail!("invalid sequencer gossip length");
+        }
         let mut decoder = snap::raw::Decoder::new();
         let decompressed = decoder.decompress_vec(data)?;
 
@@ -56,7 +60,10 @@ impl TryFrom<&SequencerCommitment> for ExecutionPayload {
     type Error = eyre::Report;
 
     fn try_from(value: &SequencerCommitment) -> Result<Self> {
-        let payload_bytes = &value.data[32..];
+        let payload_bytes = value
+            .data
+            .get(32..)
+            .ok_or_else(|| eyre::eyre!("truncated sequencer payload"))?;
         ExecutionPayload::from_ssz_bytes(payload_bytes).map_err(|_| eyre::eyre!("decode failed"))
     }
 }
@@ -73,4 +80,18 @@ fn signature_msg(data: &[u8], chain_id: u64) -> B256 {
     ];
 
     keccak256(signing_data.concat())
+}
+
+#[cfg(test)]
+mod length_tests {
+    use super::*;
+    #[test]
+    fn short_gossip_is_rejected_without_panicking() {
+        for len in 0..65 {
+            let compressed = snap::raw::Encoder::new()
+                .compress_vec(&vec![0; len])
+                .unwrap();
+            assert!(SequencerCommitment::new(&compressed).is_err());
+        }
+    }
 }

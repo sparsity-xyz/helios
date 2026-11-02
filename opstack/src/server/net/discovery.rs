@@ -42,12 +42,12 @@ pub fn start(addr: SocketAddr, chain_id: u64) -> Result<Receiver<SocketAddr>> {
                         .iter()
                         .filter(|node| is_valid_node(node, chain_id))
                         .flat_map(|peer| {
-                            if let Some(ip) = peer.ip4() {
-                                return Some(SocketAddr::new(IpAddr::V4(ip), peer.tcp4().unwrap()));
+                            if let (Some(ip), Some(port)) = (peer.ip4(), peer.tcp4()) {
+                                return Some(SocketAddr::new(IpAddr::V4(ip), port));
                             }
 
-                            if let Some(ip) = peer.ip6() {
-                                return Some(SocketAddr::new(IpAddr::V6(ip), peer.tcp6().unwrap()));
+                            if let (Some(ip), Some(port)) = (peer.ip6(), peer.tcp6()) {
+                                return Some(SocketAddr::new(IpAddr::V6(ip), port));
                             }
 
                             None
@@ -114,8 +114,10 @@ impl TryFrom<&[u8]> for OpStackEnrData {
     fn try_from(value: &[u8]) -> Result<Self> {
         let mut buffer = value;
         let bytes = Bytes::decode(&mut buffer)?;
-        let (chain_id, rest) = decode::u64(&bytes)?;
-        let (version, _) = decode::u64(rest)?;
+        let (chain_id, rest) =
+            decode::u64(&bytes).map_err(|e| eyre::eyre!("varint decode error: {e:?}"))?;
+        let (version, _) =
+            decode::u64(rest).map_err(|e| eyre::eyre!("varint decode error: {e:?}"))?;
 
         Ok(Self { chain_id, version })
     }
