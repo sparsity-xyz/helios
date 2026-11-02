@@ -36,6 +36,10 @@ use helios_ethereum::rpc::http_rpc::HttpRpc;
 use crate::{config::Config, types::ExecutionPayload, SequencerCommitment};
 
 // Storage slot containing the unsafe signer address in all superchain system config contracts
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_HEAD_AGE: u64 = 60;
+
 const UNSAFE_SIGNER_SLOT: &str =
     "0x65a7ed542fb37fe237fdfbdd70b31598523fe5b32879e307bae27a0bd9581c08";
 
@@ -43,6 +47,8 @@ pub struct ConsensusClient {
     block_recv: Option<Receiver<Block<Transaction>>>,
     finalized_block_recv: Option<watch::Receiver<Option<Block<Transaction>>>>,
     chain_id: u64,
+    accepted_timestamp: watch::Receiver<Option<u64>>,
+    shutdown: watch::Sender<bool>,
 }
 
 impl ConsensusClient {
@@ -50,11 +56,16 @@ impl ConsensusClient {
         let (block_send, block_recv) = channel(256);
         let (finalized_block_send, finalized_block_recv) = watch::channel(None);
 
+        let (accepted_send, accepted_timestamp) = watch::channel(None);
+        let (shutdown, mut shutdown_recv) = watch::channel(false);
+
         let mut inner = Inner {
             server_url: config.consensus_rpc.clone(),
             unsafe_signer: Arc::new(Mutex::new(config.chain.unsafe_signer)),
             chain_id: config.chain.chain_id,
             latest_block: None,
+            accepted_send,
+            http: reqwest::Client::new(),
             block_send,
             finalized_block_send,
         };
@@ -72,10 +83,18 @@ impl ConsensusClient {
         run(async move {
             let mut interval = interval(Duration::from_secs(1));
             loop {
-                if let Err(e) = inner.advance().await {
-                    error!(target: "helios::opstack", "failed to advance: {}", e);
+                tokio::select! {
+                    _ = shutdown_recv.changed() => break,
+                    result = inner.advance() => {
+                        if let Err(e) = result {
+                            error!(target: "helios::opstack", "failed to advance: {}", e);
+                        }
+                    }
                 }
-                interval.tick().await;
+                tokio::select! {
+                    _ = shutdown_recv.changed() => break,
+                    _ = interval.tick() => {}
+                }
             }
         });
 
@@ -83,6 +102,8 @@ impl ConsensusClient {
             block_recv: Some(block_recv),
             finalized_block_recv: Some(finalized_block_recv),
             chain_id: config.chain.chain_id,
+            accepted_timestamp,
+            shutdown,
         }
     }
 }
@@ -94,6 +115,7 @@ impl Consensus<Block<Transaction>> for ConsensusClient {
     }
 
     fn shutdown(&self) -> eyre::Result<()> {
+        self.shutdown.send_replace(true);
         Ok(())
     }
 
@@ -114,8 +136,12 @@ impl Consensus<Block<Transaction>> for ConsensusClient {
     }
 
     async fn wait_synced(&self) -> eyre::Result<()> {
-        // OpStack consensus doesn't have a sync process, so immediately return Ok
-        Ok(())
+        wait_for_fresh_head(
+            self.accepted_timestamp.clone(),
+            self.shutdown.subscribe(),
+            SYNC_TIMEOUT,
+        )
+        .await
     }
 }
 
@@ -125,6 +151,8 @@ struct Inner {
     unsafe_signer: Arc<Mutex<Address>>,
     chain_id: u64,
     latest_block: Option<u64>,
+    accepted_send: watch::Sender<Option<u64>>,
+    http: reqwest::Client,
     block_send: Sender<Block<Transaction>>,
     finalized_block_send: watch::Sender<Option<Block<Transaction>>>,
 }
@@ -135,46 +163,96 @@ impl Inner {
             .server_url
             .join("latest")
             .map_err(|e| eyre!("Failed to construct latest URL: {}", e))?;
-        let commitment = reqwest::get(url)
-            .await?
-            .json::<SequencerCommitment>()
-            .await?;
+        let commitment = fetch_commitment(&self.http, url, REQUEST_TIMEOUT).await?;
+        self.accept(commitment).await
+    }
 
+    async fn accept(&mut self, commitment: SequencerCommitment) -> Result<()> {
         let curr_signer = *self
             .unsafe_signer
             .lock()
             .map_err(|_| eyre!("failed to lock signer"))?;
-        if commitment.verify(curr_signer, self.chain_id).is_ok() {
-            let payload = ExecutionPayload::try_from(&commitment)?;
-            if self
-                .latest_block
-                .map(|latest| payload.block_number > latest)
-                .unwrap_or(true)
-            {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default();
-
-                let timestamp = Duration::from_secs(payload.timestamp);
-                let age = now.saturating_sub(timestamp);
-                let number = payload.block_number;
-
-                if let Ok(block) = payload_to_block(payload) {
-                    self.latest_block = Some(block.header.number);
-                    _ = self.block_send.send(block).await;
-
-                    tracing::debug!(
-                        "unsafe head updated: block={} age={}s",
-                        number,
-                        age.as_secs()
-                    );
-                } else {
-                    tracing::warn!("invalid block received");
-                }
-            }
+        commitment.verify(curr_signer, self.chain_id)?;
+        let payload = ExecutionPayload::try_from(&commitment)?;
+        check_fresh_timestamp(payload.timestamp)?;
+        if self
+            .latest_block
+            .map(|n| payload.block_number <= n)
+            .unwrap_or(false)
+        {
+            return Ok(());
         }
-
+        let timestamp = payload.timestamp;
+        let number = payload.block_number;
+        let block = payload_to_block(payload)?;
+        self.block_send
+            .send(block)
+            .await
+            .map_err(|_| eyre!("block consumer stopped"))?;
+        self.latest_block = Some(number);
+        self.accepted_send.send_replace(Some(timestamp));
+        debug!(target: "helios::opstack", "unsafe head updated: block={}", number);
         Ok(())
+    }
+}
+
+fn check_fresh_timestamp(timestamp: u64) -> Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    if now.saturating_sub(timestamp) > MAX_HEAD_AGE || timestamp > now.saturating_add(5) {
+        return Err(eyre!(
+            "sequencer head timestamp is not current: {} (now {})",
+            timestamp,
+            now
+        ));
+    }
+    Ok(())
+}
+
+async fn fetch_commitment(
+    http: &reqwest::Client,
+    url: Url,
+    timeout: Duration,
+) -> Result<SequencerCommitment> {
+    // Use the shared native/WASM timer abstraction; cover both headers and body.
+    let request = async {
+        Ok(http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    };
+    let mut deadline = interval(timeout);
+    deadline.tick().await;
+    tokio::select! {
+        result = request => result,
+        _ = deadline.tick() => Err(eyre!("signed-block request timed out after {:?}", timeout)),
+    }
+}
+
+async fn wait_for_fresh_head(
+    mut accepted: watch::Receiver<Option<u64>>,
+    mut shutdown: watch::Receiver<bool>,
+    timeout: Duration,
+) -> Result<()> {
+    let mut deadline = interval(timeout);
+    deadline.tick().await;
+    loop {
+        if *shutdown.borrow() {
+            return Err(eyre!("consensus stopped"));
+        }
+        if accepted
+            .borrow()
+            .is_some_and(|ts| check_fresh_timestamp(ts).is_ok())
+        {
+            return Ok(());
+        }
+        tokio::select! {
+            result = accepted.changed() => { result.map_err(|_| eyre!("consensus task stopped"))?; },
+            _ = shutdown.changed() => return Err(eyre!("consensus stopped")),
+            _ = deadline.tick() => return Err(eyre!("no fresh verified sequencer head within {:?}", timeout)),
+        }
     }
 }
 
@@ -283,7 +361,8 @@ fn payload_to_block(value: ExecutionPayload) -> Result<Block<Transaction>> {
         .map(|(i, tx_bytes)| {
             let tx_bytes = tx_bytes.to_vec();
             let mut tx_bytes_slice = tx_bytes.as_slice();
-            let tx_envelope = OpTxEnvelope::decode(&mut tx_bytes_slice).unwrap();
+            let tx_envelope = OpTxEnvelope::decode(&mut tx_bytes_slice)
+                .map_err(|e| eyre!("invalid sequencer transaction: {}", e))?;
             let base_fee = tx_envelope.effective_gas_price(Some(value.base_fee_per_gas.to()));
             let recovered = tx_envelope.try_into_recovered()?;
 
@@ -360,4 +439,167 @@ fn payload_to_block(value: ExecutionPayload) -> Result<Block<Transaction>> {
 
     Ok(Block::new(header, BlockTransactions::Full(txs))
         .with_withdrawals(Some(Withdrawals::new(withdrawals))))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod recovery_tests {
+    use super::*;
+    use alloy::signers::{local::PrivateKeySigner, SignerSync};
+    use ssz::Encode;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+    fn signed(
+        signer: &PrivateKeySigner,
+        chain: u64,
+        timestamp: u64,
+        number: u64,
+    ) -> SequencerCommitment {
+        let payload = ExecutionPayload {
+            parent_hash: B256::ZERO,
+            fee_recipient: Address::ZERO,
+            state_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: vec![0; 256].into(),
+            prev_randao: B256::ZERO,
+            block_number: number,
+            gas_limit: 30_000_000,
+            gas_used: 0,
+            timestamp,
+            extra_data: Vec::new().try_into().unwrap(),
+            base_fee_per_gas: U256::from(1),
+            block_hash: B256::ZERO,
+            transactions: Vec::new().try_into().unwrap(),
+            withdrawals: Vec::new().try_into().unwrap(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            withdrawals_root: B256::ZERO,
+        };
+        let data: alloy::primitives::Bytes = [vec![0; 32], payload.as_ssz_bytes()].concat().into();
+        let signature = signer
+            .sign_hash_sync(&crate::signature_msg(&data, chain))
+            .unwrap();
+        SequencerCommitment { data, signature }
+    }
+
+    async fn responder(
+        body: String,
+        status: &str,
+        stall: bool,
+    ) -> (Url, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/latest", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",body.len());
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf).await;
+            if stall {
+                std::future::pending::<()>().await;
+            }
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn hung_request_is_bounded_and_next_request_recovers() {
+        let http = reqwest::Client::new();
+        let (url, task) = responder(String::new(), "200 OK", true).await;
+        let err = fetch_commitment(&http, url, Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        task.abort();
+        let signer = PrivateKeySigner::random();
+        let c = signed(&signer, 84532, now(), 1);
+        let (url, task) = responder(serde_json::to_string(&c).unwrap(), "200 OK", false).await;
+        let c = fetch_commitment(&http, url, Duration::from_secs(2))
+            .await
+            .unwrap();
+        c.verify(signer.address(), 84532).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_http_status_and_rejects_malformed_json() {
+        for (body, status, expected) in [
+            ("bad gateway", "502 Bad Gateway", "502"),
+            ("null", "200 OK", "decoding"),
+        ] {
+            let (url, task) = responder(body.into(), status, false).await;
+            let err = fetch_commitment(&reqwest::Client::new(), url, Duration::from_secs(2))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(expected), "{err}");
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn only_fresh_correctly_signed_heads_make_consensus_ready() {
+        let signer = PrivateKeySigner::random();
+        let other = PrivateKeySigner::random();
+        let (block_send, mut blocks) = channel(8);
+        let (finalized_block_send, _) = watch::channel(None);
+        let (accepted_send, accepted) = watch::channel(None);
+        let (shutdown, shutdown_recv) = watch::channel(false);
+        let mut inner = Inner {
+            server_url: "http://127.0.0.1/".parse().unwrap(),
+            unsafe_signer: Arc::new(Mutex::new(signer.address())),
+            chain_id: 84532,
+            latest_block: None,
+            block_send,
+            finalized_block_send,
+            accepted_send,
+            http: reqwest::Client::new(),
+        };
+        assert!(inner.accept(signed(&other, 84532, now(), 1)).await.is_err());
+        assert!(inner.accept(signed(&signer, 1, now(), 1)).await.is_err());
+        assert!(inner
+            .accept(signed(&signer, 84532, now() - 61, 1))
+            .await
+            .is_err());
+        assert!(inner
+            .accept(signed(&signer, 84532, now() + 60, 1))
+            .await
+            .is_err());
+        assert!(accepted.borrow().is_none());
+        assert!(blocks.try_recv().is_err());
+        assert!(wait_for_fresh_head(
+            accepted.clone(),
+            shutdown_recv.clone(),
+            Duration::from_millis(20)
+        )
+        .await
+        .is_err());
+        inner
+            .accept(signed(&signer, 84532, now(), 2))
+            .await
+            .unwrap();
+        wait_for_fresh_head(accepted, shutdown_recv, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(blocks.recv().await.unwrap().header.number, 2);
+        shutdown.send_replace(true);
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_waiting_for_sync() {
+        let (_tx, rx) = watch::channel(None);
+        let (stop, stop_rx) = watch::channel(false);
+        stop.send_replace(true);
+        assert!(wait_for_fresh_head(rx, stop_rx, Duration::from_secs(2))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("stopped"));
+    }
 }

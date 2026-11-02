@@ -23,38 +23,67 @@ use super::bootnodes::bootnodes;
 /// Starts the [Discv5] discovery service and continually tries to find new peers.
 /// Returns a [Receiver] to receive [Peer] structs
 pub fn start(addr: SocketAddr, chain_id: u64) -> Result<Receiver<SocketAddr>> {
-    let bootnodes = bootnodes();
+    let mut bootnodes = bootnodes();
+    // Prefer this chain's seeds. A mixed bootstrap table spends most queries on
+    // unrelated networks and can delay discovery of useful Base Sepolia peers.
+    let same_chain = bootnodes
+        .iter()
+        .filter(|node| is_valid_node(node, chain_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !same_chain.is_empty() {
+        bootnodes = same_chain;
+    }
     let mut disc = create_disc(addr, chain_id)?;
 
     let (sender, recv) = mpsc::channel::<SocketAddr>(256);
 
     tokio::spawn(async move {
+        // Discovery queries need not return the bootstrap nodes themselves.
+        // Seed gossip with reachable same-chain bootnodes as well as discovered peers.
+        let initial_peers = bootnodes
+            .iter()
+            .filter(|node| is_valid_node(node, chain_id))
+            .filter_map(peer_address)
+            .collect::<Vec<_>>();
         bootnodes.into_iter().for_each(|enr| _ = disc.add_enr(enr));
-        disc.start().await.unwrap();
+        if let Err(error) = disc.start().await {
+            tracing::error!(%error, "peer discovery could not start");
+            return;
+        }
 
         tracing::info!("started peer discovery");
+        for peer in initial_peers {
+            if sender.send(peer).await.is_err() {
+                return;
+            }
+        }
 
         loop {
             let target = NodeId::random();
-            match disc.find_node(target).await {
+            match disc
+                .find_node_predicate(
+                    target,
+                    Box::new(move |node| is_valid_node(node, chain_id)),
+                    8,
+                )
+                .await
+            {
                 Ok(nodes) => {
                     let peers = nodes
                         .iter()
                         .filter(|node| is_valid_node(node, chain_id))
-                        .flat_map(|peer| {
-                            if let Some(ip) = peer.ip4() {
-                                return Some(SocketAddr::new(IpAddr::V4(ip), peer.tcp4().unwrap()));
-                            }
-
-                            if let Some(ip) = peer.ip6() {
-                                return Some(SocketAddr::new(IpAddr::V6(ip), peer.tcp6().unwrap()));
-                            }
-
-                            None
-                        });
-
+                        .filter_map(peer_address)
+                        .collect::<Vec<_>>();
+                    tracing::debug!(
+                        nodes = nodes.len(),
+                        peers = peers.len(),
+                        "peer discovery result"
+                    );
                     for peer in peers {
-                        _ = sender.send(peer).await;
+                        if sender.send(peer).await.is_err() {
+                            return;
+                        }
                     }
                 }
                 Err(err) => {
@@ -67,6 +96,16 @@ pub fn start(addr: SocketAddr, chain_id: u64) -> Result<Receiver<SocketAddr>> {
     });
 
     Ok(recv)
+}
+
+fn peer_address(peer: &Enr<CombinedKey>) -> Option<SocketAddr> {
+    if let (Some(ip), Some(port)) = (peer.ip4(), peer.tcp4()) {
+        return Some(SocketAddr::new(IpAddr::V4(ip), port));
+    }
+    if let (Some(ip), Some(port)) = (peer.ip6(), peer.tcp6()) {
+        return Some(SocketAddr::new(IpAddr::V6(ip), port));
+    }
+    None
 }
 
 /// Returns `true` if a node [Enr] contains an `opstack` key and is on the same network.
@@ -114,8 +153,10 @@ impl TryFrom<&[u8]> for OpStackEnrData {
     fn try_from(value: &[u8]) -> Result<Self> {
         let mut buffer = value;
         let bytes = Bytes::decode(&mut buffer)?;
-        let (chain_id, rest) = decode::u64(&bytes)?;
-        let (version, _) = decode::u64(rest)?;
+        let (chain_id, rest) =
+            decode::u64(&bytes).map_err(|e| eyre::eyre!("varint decode error: {e:?}"))?;
+        let (version, _) =
+            decode::u64(rest).map_err(|e| eyre::eyre!("varint decode error: {e:?}"))?;
 
         Ok(Self { chain_id, version })
     }
@@ -133,5 +174,20 @@ impl From<OpStackEnrData> for Vec<u8> {
         let opstack = [chain_id_slice, version_slice].concat();
 
         rlp::encode(&opstack).to_vec()
+    }
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    #[test]
+    fn base_sepolia_has_dialable_same_chain_bootstrap_peers() {
+        let peers = bootnodes()
+            .into_iter()
+            .filter(|node| is_valid_node(node, 84532))
+            .filter_map(|node| peer_address(&node))
+            .collect::<Vec<_>>();
+        assert!(peers.contains(&"107.21.251.55:9222".parse().unwrap()));
+        assert!(peers.contains(&"18.210.176.114:9222".parse().unwrap()));
     }
 }
